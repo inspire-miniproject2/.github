@@ -137,6 +137,63 @@ flowchart TB
 | Attachment Storage | Amazon S3 |
 | Code Quality | Qodana |
 
+## CI/CD
+
+Frontend와 Backend 저장소는 GitHub Actions를 사용해 검증과 컨테이너 이미지 발행을 자동화합니다. Backend의 개발 환경은 이미지 발행 이후 AWS EC2 배포까지 연결됩니다.
+
+```mermaid
+flowchart LR
+    FrontPush["Frontend develop Push"] --> FrontCI["Frontend CI"]
+    FrontCI -->|"성공"| FrontImage["Frontend Image Build"]
+    FrontImage --> GHCR["GHCR<br/>commit SHA·latest"]
+    GHCR --> FrontDeploy["Frontend 자동 배포"]
+
+    BackPush["Backend develop Push"] --> BackCI["Backend CI"]
+    BackPush --> BackImage["8개 Service Image Build"]
+    BackImage --> GHCR
+    GHCR --> BackDeploy["Backend 자동 배포"]
+
+    FrontDeploy --> OIDC["AWS OIDC·Systems Manager"]
+    BackDeploy --> OIDC
+    OIDC --> EC2["Development EC2"]
+```
+
+### Frontend Pipeline
+| Workflow | 실행 조건 | 주요 작업 |
+| --- | --- | --- |
+| CI | Pull Request 및 develop Push 시 자동 실행, 필요 시 수동 실행 | PR의 최신 커밋 제목 규칙 검사, pnpm 의존성 설치, TypeScript 타입 검사, Mock API를 비활성화한 Vite 프로덕션 빌드 |
+| Frontend CD | develop Push의 CI 성공 후 자동 실행, 필요 시 수동 실행 | Docker Buildx 이미지 빌드, SBOM·Provenance 생성, GHCR 이미지 발행, AWS OIDC·SSM을 통한 개발 EC2 배포, 상태 점검 및 실패 시 롤백 |
+
+Frontend CI는 pnpm-lock.yaml을 기준으로 고정된 의존성을 설치합니다. 이후 Mock API를 비활성화하고 VITE_API_BASE_URL=/api/v1을 적용한 프로덕션 빌드가 정상적으로 생성되는지 확인합니다.
+
+develop 브랜치의 CI가 성공하면 ghcr.io/inspire-miniproject2/frontend에 7자리로 단축한 Commit SHA와 latest 태그로 이미지를 발행하고 개발 EC2에 자동 배포합니다. 배포 후 /health 경로를 확인하며, 배포 과정 또는 상태 점검에서 오류가 발생하면 이전 이미지로 자동 롤백합니다.
+
+### Backend Pipeline
+| Workflow | 실행 조건 | 주요 작업 |
+| --- | --- | --- |
+| CI | Pull Request 및 develop Push 시 자동 실행, 필요 시 수동 실행 | 최신 커밋 제목 규칙, Docker Compose 및 Shell Script 검증, Java 17 환경에서 8개 서비스 Gradle 테스트 |
+| Qodana | Pull Request 및 main·develop·feature/backend-b-contracts Push 시 자동 실행, 필요 시 수동 실행 | 정적 코드 분석, GitHub Check 및 PR Annotation 제공 |
+| Container Images | develop Push 시 자동 실행, 필요 시 수동 실행 | 8개 Spring Boot 서비스 이미지 빌드, GHCR에 7자리로 단축한 Commit SHA와 latest 태그 발행 |
+| Deploy Development | develop 이미지 발행 성공 후 자동 실행, 필요 시 수동 실행 | GitHub OIDC로 임시 AWS 권한 획득, AWS Systems Manager를 통한 개발 EC2 배포, 전체 서비스 상태 점검 및 실패 시 롤백 |
+
+Pull Request 단계에서 CI를 통해 소스 코드와 배포 설정을 검증합니다. 검증된 변경 사항이 develop 브랜치에 병합되면 8개 서비스의 컨테이너 이미지를 빌드하여 발행하고, 이미지 발행에 성공하면 개발 EC2에 자동 배포합니다.
+
+수동으로 Container Images를 실행할 때는 전체 서비스 또는 특정 서비스 하나를 선택하여 이미지를 발행할 수 있습니다. develop 브랜치 Push로 자동 실행될 때는 8개 서비스 이미지를 모두 빌드합니다.
+
+백엔드 배포는 장기 AWS Access Key를 GitHub에 저장하지 않고 GitHub OIDC를 통해 IAM Role을 위임받습니다. CI/CD 과정에서는 EC2의 SSH 포트를 사용하지 않고 AWS Systems Manager로 원격 배포 명령을 실행합니다.
+
+실제 배포에는 latest 대신 7자리 이상의 Commit SHA 태그를 사용하여 배포 버전을 명확하게 관리합니다. 배포 후 전체 서비스 상태와 Eureka 등록, Gateway 라우팅을 점검하며, 배포 과정 또는 배포 직후 상태 점검에서 오류가 발생하면 이전 이미지로 자동 롤백합니다.
+
+
+### CI/CD 운영 원칙
+
+- `main`과 `develop`에 직접 기능 코드를 반영하지 않고 기능 브랜치와 Pull Request를 사용합니다.
+- 모든 이미지에는 재현 가능한 commit SHA 태그와 편의용 `latest` 태그를 함께 발행합니다.
+- 비밀번호, JWT Secret, SMTP 인증정보와 배포 자격증명은 코드가 아닌 GitHub Secrets 및 배포 환경에서 관리합니다.
+- Docker Compose 설정과 실행 스크립트를 CI에서 먼저 검증해 배포 단계의 구성 오류를 줄입니다.
+- 동일 브랜치의 중복 CI는 취소하고, 이미지 발행과 배포 작업은 동시에 실행되지 않도록 concurrency를 제어합니다.
+- 배포 실패 시 GitHub Actions가 Systems Manager의 표준 출력과 오류를 수집하고 작업을 실패 처리합니다.
+
 ## 설계 특징
 
 - **동기·비동기 통신 분리**: 즉시 결과가 필요한 자동 배정은 OpenFeign으로 호출하고, 알림과 통계는 Kafka 이벤트로 처리합니다.
